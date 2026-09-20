@@ -24,7 +24,7 @@ python3 dirloc.py --help
 dirloc save  [DIR] -d "description"        # record the layout of DIR (default: .)
 dirloc list  [DIR]                          # list snapshots with date, file count, description
 dirloc show  [DIR] -s SNAPSHOT              # print what a snapshot contains
-dirloc diff  [DIR] -s SNAPSHOT              # show what restore would do (exit 1 if anything differs)
+dirloc diff  [DIR] -s SNAPSHOT              # show what restore would do (exit 1 if anything differs or is unreadable)
 dirloc restore [DIR] -s SNAPSHOT [--dry-run] [-o OUT_DIR]
 dirloc delete [DIR] -s SNAPSHOT
 dirloc fingerprint FILE...                  # print fingerprints
@@ -58,7 +58,9 @@ staging directory, so swaps and chains (`a -> b`, `b -> c`) are safe; if a
 move fails midway, all moves are rolled back (and if even that fails, the
 files still in transit are left in `.dirloc/staging-*` and the path is
 reported, so nothing is lost). Directories left empty by the moves are
-removed. `--dry-run` (or `diff`) prints the plan without touching anything.
+removed. `--output-dir` copies file by file with no rollback: if a copy fails,
+the files already copied stay in `OUT` (the source is never modified).
+`--dry-run` (or `diff`) prints the plan without touching anything.
 
 ### Duplicates
 

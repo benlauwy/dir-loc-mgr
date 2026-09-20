@@ -392,6 +392,57 @@ class SnapshotTests(unittest.TestCase):
         contents = {p.read_bytes() for p in self.root.rglob("*") if p.is_file() and p.suffix != ".json"}
         self.assertTrue({b"one", b"three"} <= contents)
 
+    def test_rollback_removes_dirs_created_for_nested_targets(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        # a/one.txt -> a  (file at the directory's old path), c/three.txt -> y
+        shutil.rmtree(self.root / "a")
+        write(self.root, "a", "one")
+        (self.root / "c/three.txt").rename(self.root / "y")
+        before = files_under(self.root)
+        plan = dirloc.build_plan(self.root, snap)
+        self.assertIn(("a", "a/one.txt"), plan.moves)
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 4:  # the second install fails; everything after must succeed
+                raise OSError("boom")
+            real_replace(src, dst)
+
+        with unittest.mock.patch.object(dirloc.os, "replace", flaky), self.assertRaises(OSError):
+            dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertEqual(files_under(self.root), before)
+        self.assertTrue((self.root / "a").is_file())
+        self.assertEqual((self.root / "a").read_text(), "one")
+        self.assertFalse(list((self.root / dirloc.STORE_DIR).glob("staging-*")))
+
+    def test_failed_save_does_not_reserve_name(self):
+        with (
+            unittest.mock.patch.object(dirloc.json, "dumps", side_effect=OSError("disk full")),
+            self.assertRaises(OSError),
+        ):
+            dirloc.save_snapshot(self.root, name="baseline")
+        self.assertFalse((self.root / dirloc.STORE_DIR / "baseline.json").exists())
+        snap, _ = dirloc.save_snapshot(self.root, name="baseline")
+        self.assertEqual(snap.id, "baseline")
+
+    def test_diff_fails_on_unreadable_files(self):
+        dirloc.save_snapshot(self.root, name="s")
+        code, _, _ = self.run_cli("diff", str(self.root))
+        self.assertEqual(code, 0)
+        real_fp = dirloc.fingerprint
+
+        def unreadable(path, *a, **kw):
+            if path.name == "two.txt":
+                raise PermissionError("denied")
+            return real_fp(path, *a, **kw)
+
+        with unittest.mock.patch.object(dirloc, "fingerprint", unreadable):
+            code, out, _ = self.run_cli("diff", str(self.root))
+        self.assertEqual(code, 1)
+        self.assertIn("unreadable a/b/two.txt", out)
+
     def test_latest_tie_break_is_deterministic(self):
         s1, _p1 = dirloc.save_snapshot(self.root, name="aaa")
         s2, p2 = dirloc.save_snapshot(self.root, name="bbb")

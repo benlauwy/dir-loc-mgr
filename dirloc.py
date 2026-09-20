@@ -221,10 +221,17 @@ def save_snapshot(root: Path, description: str = "", name: str | None = None) ->
     sdir.mkdir(exist_ok=True)
     out = sdir / f"{snap.id}.json"
     try:
-        with out.open("x", encoding="utf-8") as fh:
-            fh.write(json.dumps(snap.to_json(), indent=2) + "\n")
+        fh = out.open("x", encoding="utf-8")
     except FileExistsError:
         raise DirlocError(f"snapshot {snap.id!r} already exists") from None
+    try:
+        with fh:
+            fh.write(json.dumps(snap.to_json(), indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        out.unlink(missing_ok=True)
+        raise
     return snap, out
 
 
@@ -406,6 +413,17 @@ def _check_targets(base: Path, targets: list[str], vacating: set[str]) -> None:
         raise DirlocError(f"cannot restore {dst}: target already exists")
 
 
+def _mkdir_tracking(d: Path) -> list[Path]:
+    """``mkdir -p`` that returns the directories it actually created, shallowest first."""
+    missing: list[Path] = []
+    while not d.exists():
+        missing.append(d)
+        d = d.parent
+    for p in reversed(missing):
+        p.mkdir()
+    return list(reversed(missing))
+
+
 def _remove_empty_tree(d: Path) -> list[Path]:
     """Remove *d* and its (empty) subdirectories; return what was removed, deepest first."""
     removed: list[Path] = []
@@ -446,6 +464,7 @@ def apply_in_place(root: Path, plan: Plan, snap_id: str) -> None:
     staged: list[tuple[str, Path]] = []  # (src, tmp)
     installed: list[tuple[Path, Path]] = []  # (final, tmp)
     removed_dirs: list[Path] = []
+    created_dirs: list[Path] = []
     try:
         for i, (src, _dst) in enumerate(all_moves):
             tmp = staging / str(i)
@@ -458,13 +477,15 @@ def apply_in_place(root: Path, plan: Plan, snap_id: str) -> None:
                 removed_dirs.extend(_remove_empty_tree(final))
             elif final.exists() or final.is_symlink():
                 raise DirlocError(f"cannot restore {dst}: target already exists")
-            final.parent.mkdir(parents=True, exist_ok=True)
+            created_dirs.extend(_mkdir_tracking(final.parent))
             os.replace(tmp, final)
             installed.append((final, tmp))
     except Exception as exc:
         try:
             for final, tmp in reversed(installed):
                 os.replace(final, tmp)
+            for d in reversed(created_dirs):
+                d.rmdir()
             for d in reversed(removed_dirs):
                 d.mkdir(exist_ok=True)
             for src, tmp in staged:
@@ -576,7 +597,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     snap = find_snapshot(root, args.snapshot)
     plan = build_plan(root, snap)
     _print_plan(plan, "move")
-    return 0 if plan.is_noop and not plan.missing else 1
+    return 0 if plan.is_noop and not plan.missing and not plan.unreadable else 1
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
@@ -639,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("list", cmd_list, "list snapshots of DIR")
     add("show", cmd_show, "print a snapshot's contents", snapshot=True)
-    add("diff", cmd_diff, "show what restore would do (exit 1 if anything differs)", snapshot=True)
+    add("diff", cmd_diff, "show what restore would do (exit 1 if anything differs or could not be read)", snapshot=True)
 
     sp = add("restore", cmd_restore, "put files back at their saved paths", snapshot=True)
     sp.add_argument("--dry-run", action="store_true", help="only print the plan")
