@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dir-loc-mgr"
+version = "0.1.0"
+description = "Save and restore the layout (paths + filenames) of a directory, identifying files by content fingerprint"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+dirloc = "dirloc:main"
+
+[tool.setuptools]
+py-modules = ["dirloc"]
+
+[tool.ruff]
+line-length = 120
