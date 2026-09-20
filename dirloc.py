@@ -15,6 +15,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -30,10 +31,32 @@ STAGING_PREFIX = "staging-"
 CHUNK_SIZE = 64 * 1024
 FORMAT_VERSION = 1
 FINGERPRINT_SCHEME = f"size+sha256(head{CHUNK_SIZE},mid{CHUNK_SIZE},tail{CHUNK_SIZE})"
+SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 
 class DirlocError(Exception):
     pass
+
+
+def validate_snapshot_name(name: str) -> str:
+    if name == "latest" or not SNAPSHOT_NAME_RE.match(name):
+        raise DirlocError(f"invalid snapshot name {name!r}: use letters, digits, '.', '_' or '-' (not 'latest')")
+    return name
+
+
+def validate_rel_path(rel: str) -> str:
+    """Reject paths that could escape the managed directory or touch the snapshot store."""
+    bad = (
+        not isinstance(rel, str)
+        or not rel
+        or rel.startswith("/")
+        or (os.sep == "\\" and ("\\" in rel or ":" in rel))
+        or any(part in ("", ".", "..") for part in rel.split("/"))
+        or rel.split("/", 1)[0] == STORE_DIR
+    )
+    if bad:
+        raise DirlocError(f"unsafe path in snapshot: {rel!r}")
+    return rel
 
 
 # --------------------------------------------------------------------------- #
@@ -139,12 +162,23 @@ class Snapshot:
     def from_json(cls, data: dict) -> Snapshot:
         if data.get("format_version") != FORMAT_VERSION:
             raise DirlocError(f"unsupported snapshot format: {data.get('format_version')!r}")
+        files = data["files"]
+        if not isinstance(files, dict):
+            raise DirlocError("snapshot 'files' must be an object")
+        for rel in files.values():
+            validate_rel_path(rel)
+        dups = data.get("skipped_duplicates", {})
+        if not isinstance(dups, dict) or not all(isinstance(v, list) for v in dups.values()):
+            raise DirlocError("snapshot 'skipped_duplicates' must be an object of lists")
+        for paths in dups.values():
+            for rel in paths:
+                validate_rel_path(rel)
         return cls(
-            id=data["id"],
-            created=data["created"],
-            description=data.get("description", ""),
-            files=data["files"],
-            skipped_duplicates=data.get("skipped_duplicates", {}),
+            id=validate_snapshot_name(str(data["id"])),
+            created=str(data["created"]),
+            description=str(data.get("description", "")),
+            files=files,
+            skipped_duplicates=dups,
             unreadable=data.get("unreadable", []),
             root=data.get("root", ""),
         )
@@ -160,6 +194,7 @@ def _new_id() -> str:
 
 
 def save_snapshot(root: Path, description: str = "", name: str | None = None) -> tuple[Snapshot, Path]:
+    snap_id = validate_snapshot_name(name) if name is not None else _new_id()
     sc = scan(root)
     files: dict[str, str] = {}
     dups: dict[str, list[str]] = {}
@@ -169,16 +204,14 @@ def save_snapshot(root: Path, description: str = "", name: str | None = None) ->
         else:
             dups[fp] = paths
     snap = Snapshot(
-        id=name or _new_id(),
-        created=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        id=snap_id,
+        created=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="microseconds"),
         description=description,
         files=files,
         skipped_duplicates=dups,
         unreadable=sc.unreadable,
         root=str(root),
     )
-    if "/" in snap.id or snap.id in ("", ".", "..", "latest"):
-        raise DirlocError(f"invalid snapshot name: {snap.id!r}")
     sdir = store_dir(root)
     sdir.mkdir(exist_ok=True)
     out = sdir / f"{snap.id}.json"
@@ -198,7 +231,7 @@ def list_snapshots(root: Path) -> list[Snapshot]:
             snaps.append(Snapshot.from_json(json.loads(f.read_text())))
         except (OSError, ValueError, KeyError, DirlocError) as e:
             print(f"warning: skipping unreadable snapshot {f.name}: {e}", file=sys.stderr)
-    snaps.sort(key=lambda s: s.created)
+    snaps.sort(key=lambda s: (s.created, s.id))
     return snaps
 
 
@@ -242,6 +275,7 @@ class Plan:
     unchanged: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)  # saved paths whose content is gone
     unsorted: list[tuple[str, str]] = field(default_factory=list)  # (current, _unsorted target)
+    ambiguous: list[str] = field(default_factory=list)  # content that was duplicated at save time
     unreadable: list[str] = field(default_factory=list)
 
     @property
@@ -280,8 +314,15 @@ def build_plan(root: Path, snap: Snapshot) -> Plan:
         claimed.add(src)
         leftovers.extend(p for p in current if p != src)
 
+    # Content that was duplicated when the snapshot was taken has no single
+    # saved location, so leave every copy where it is.
+    for fp in snap.skipped_duplicates:
+        for rel in sc.by_fp.get(fp, []):
+            plan.ambiguous.append(rel)
+            claimed.add(rel)
+
     unknown = [p for p in sc.path_to_fp if p not in claimed and p not in leftovers]
-    taken = set(snap.files.values())
+    taken = set(snap.files.values()) | set(plan.ambiguous)
     to_unsort: list[str] = []
     for rel in sorted(leftovers + unknown):
         if rel.startswith(UNSORTED_DIR + "/") and rel not in taken:
@@ -301,6 +342,51 @@ def build_plan(root: Path, snap: Snapshot) -> Plan:
 # --------------------------------------------------------------------------- #
 
 
+def _ancestors(base: Path, rel: str) -> Iterator[Path]:
+    parts = PurePosixPath(rel).parts[:-1]
+    for i in range(1, len(parts) + 1):
+        yield base.joinpath(*parts[:i])
+
+
+def _check_targets(base: Path, targets: list[str], vacating: set[str]) -> None:
+    """Raise unless every target path can be created without clobbering anything.
+
+    *vacating* holds relative paths (under *base*) that will have been moved
+    away before targets are written; a target may be a file that is being
+    moved, or a directory whose only contents are being moved.
+    """
+    for dst in targets:
+        for anc in _ancestors(base, dst):
+            if anc.is_symlink():
+                raise DirlocError(f"cannot restore {dst}: {anc.relative_to(base)} is a symlink")
+            if anc.exists() and not anc.is_dir() and _rel(anc, base) not in vacating:
+                raise DirlocError(f"cannot restore {dst}: {anc.relative_to(base)} is not a directory")
+        final = base / dst
+        if not final.exists() and not final.is_symlink():
+            continue
+        if final.is_symlink() or final.is_file():
+            if dst not in vacating:
+                raise DirlocError(f"cannot restore {dst}: target already exists")
+            continue
+        if final.is_dir():
+            for dirpath, dirnames, filenames in os.walk(final):
+                for name in dirnames + filenames:
+                    p = Path(dirpath) / name
+                    if p.is_symlink() or (p.is_file() and _rel(p, base) not in vacating):
+                        raise DirlocError(f"cannot restore {dst}: directory is not empty ({_rel(p, base)})")
+            continue
+        raise DirlocError(f"cannot restore {dst}: target already exists")
+
+
+def _remove_empty_tree(d: Path) -> list[Path]:
+    """Remove *d* and its (empty) subdirectories; return what was removed, deepest first."""
+    removed: list[Path] = []
+    for dirpath, _dirnames, _filenames in os.walk(d, topdown=False):
+        Path(dirpath).rmdir()
+        removed.append(Path(dirpath))
+    return removed
+
+
 def _prune_empty_dirs(root: Path, dirs: set[Path]) -> None:
     for d in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
         while d != root and d.is_dir() and d.name != STORE_DIR:
@@ -312,30 +398,45 @@ def _prune_empty_dirs(root: Path, dirs: set[Path]) -> None:
 
 
 def apply_in_place(root: Path, plan: Plan, snap_id: str) -> None:
-    """Move files within *root*; a two-phase move through a staging dir avoids collisions."""
+    """Move files within *root*.
+
+    Conflicts are detected before anything is touched. Files then go through a
+    staging directory (so swaps and chains are safe); if anything fails
+    midway, every move is undone.
+    """
     all_moves = plan.moves + plan.unsorted
     if not all_moves:
         return
+    sources = {src for src, _ in all_moves}
+    _check_targets(root, [dst for _, dst in all_moves], sources)
+
     staging = store_dir(root) / f"{STAGING_PREFIX}{snap_id}-{secrets.token_hex(3)}"
     staging.mkdir(parents=True)
     vacated: set[Path] = set()
+    staged: list[tuple[str, Path]] = []  # (src, tmp)
+    installed: list[tuple[Path, Path]] = []  # (final, tmp)
+    removed_dirs: list[Path] = []
     try:
-        staged: list[tuple[Path, str]] = []
-        for i, (src, dst) in enumerate(all_moves):
-            tmp = staging / str(i)
-            os.replace(root / src, tmp)
-            vacated.add((root / src).parent)
-            staged.append((tmp, dst))
-        for tmp, dst in staged:
-            final = root / dst
-            if final.exists():
-                raise DirlocError(f"target already exists: {dst}")
-            final.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp, final)
-    except Exception:
-        # Best effort: put anything still staged back where it came from.
         for i, (src, _dst) in enumerate(all_moves):
             tmp = staging / str(i)
+            os.replace(root / src, tmp)
+            staged.append((src, tmp))
+            vacated.add((root / src).parent)
+        for (_src, tmp), (_s, dst) in zip(staged, all_moves):
+            final = root / dst
+            if final.is_dir() and not final.is_symlink():
+                removed_dirs.extend(_remove_empty_tree(final))
+            elif final.exists() or final.is_symlink():
+                raise DirlocError(f"cannot restore {dst}: target already exists")
+            final.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(tmp, final)
+            installed.append((final, tmp))
+    except Exception:
+        for final, tmp in reversed(installed):
+            os.replace(final, tmp)
+        for d in reversed(removed_dirs):
+            d.mkdir(exist_ok=True)
+        for src, tmp in staged:
             if tmp.exists():
                 (root / src).parent.mkdir(parents=True, exist_ok=True)
                 os.replace(tmp, root / src)
@@ -349,11 +450,13 @@ def apply_to_output(root: Path, plan: Plan, out: Path) -> None:
     """Copy files into *out* at their saved paths, leaving *root* untouched."""
     if out.resolve() == root.resolve() or root.resolve() in out.resolve().parents:
         raise DirlocError("--output-dir must not be the source dir or inside it")
+    copies = plan.moves + [(p, p) for p in plan.unchanged + plan.ambiguous] + plan.unsorted
     out.mkdir(parents=True, exist_ok=True)
-    for src, dst in plan.moves + [(p, p) for p in plan.unchanged] + plan.unsorted:
+    _check_targets(out, [dst for _, dst in copies], set())
+    for src, dst in copies:
         final = out / dst
-        if final.exists():
-            raise DirlocError(f"target already exists: {final}")
+        if final.is_dir():
+            _remove_empty_tree(final)
         final.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / src, final)
 
@@ -377,6 +480,8 @@ def _print_plan(plan: Plan, verb: str) -> None:
         print(f"{verb} {src} -> {dst}  (not in snapshot)")
     for p in plan.missing:
         print(f"missing {p}")
+    for p in plan.ambiguous:
+        print(f"keep {p}  (duplicate content at save time)")
     for p in plan.unreadable:
         print(f"unreadable {p}")
     print(

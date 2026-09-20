@@ -49,17 +49,22 @@ snapshot:
 | Content in snapshot but not found          | reported as `missing`                           | reported as `missing`                   |
 | File present but not in snapshot           | moved to `DIR/_unsorted/<current path>`         | copied to `OUT/_unsorted/<current path>` |
 | File already under `DIR/_unsorted/`        | left alone                                      | copied as-is                            |
+| Content was duplicated at save time        | left alone (`keep`)                             | copied as-is                            |
 
-Nothing is ever deleted. In-place restore moves every file through a staging
-directory first, so swaps and chains (`a -> b`, `b -> c`) are safe, and
-directories left empty by the moves are removed. `--dry-run` (or `diff`)
-prints the plan without touching anything.
+Nothing is ever deleted. Conflicts (a symlink in the way, a non-empty
+directory at a target path) are detected before anything is touched, and the
+restore refuses to run. In-place restore then moves every file through a
+staging directory, so swaps and chains (`a -> b`, `b -> c`) are safe; if a
+move fails midway, all moves are rolled back. Directories left empty by the
+moves are removed. `--dry-run` (or `diff`) prints the plan without touching
+anything.
 
 ### Duplicates
 
 If two files in `DIR` have identical content when you `save`, they cannot be
 told apart later, so both are skipped with a warning (they are still listed in
-the snapshot under `skipped_duplicates`). If duplicates appear *after* a save,
+the snapshot under `skipped_duplicates`, and restore leaves any copies of that
+content where they are). If duplicates appear *after* a save,
 the copy already at the saved path (or the first one, sorted) is used and the
 rest go to `_unsorted/`.
 

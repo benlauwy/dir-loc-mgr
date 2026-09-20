@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -228,6 +229,117 @@ class SnapshotTests(unittest.TestCase):
         code, _, _ = self.run_cli("delete", str(self.root), "-s", "drop")
         self.assertEqual(code, 0)
         self.assertEqual([s.id for s in dirloc.list_snapshots(self.root)], ["keep"])
+
+    def test_skipped_duplicates_stay_put_on_restore(self):
+        write(self.root, "d1.txt", "dup")
+        write(self.root, "x/d2.txt", "dup")
+        snap, _ = dirloc.save_snapshot(self.root)
+        plan = dirloc.build_plan(self.root, snap)
+        self.assertEqual(plan.unsorted, [])
+        self.assertEqual(sorted(plan.ambiguous), ["d1.txt", "x/d2.txt"])
+        out = Path(tempfile.mkdtemp()) / "out"
+        try:
+            dirloc.apply_to_output(self.root, plan, out)
+            self.assertIn("x/d2.txt", files_under(out))
+        finally:
+            shutil.rmtree(out.parent)
+
+    def test_empty_dir_at_target_is_replaced(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        (self.root / "a/one.txt").rename(self.root / "moved.txt")
+        (self.root / "a/one.txt").mkdir()
+        (self.root / "a/one.txt/sub").mkdir()
+        plan = dirloc.build_plan(self.root, snap)
+        dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertEqual((self.root / "a/one.txt").read_text(), "one")
+        # A directory whose files are all being moved out is fine too...
+        (self.root / "big.bin").rename(self.root / "big2.bin")
+        (self.root / "big.bin").mkdir()
+        write(self.root, "big.bin/extra.txt", "extra")
+        plan = dirloc.build_plan(self.root, snap)
+        dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertTrue((self.root / "big.bin").is_file())
+        self.assertEqual((self.root / "_unsorted/big.bin/extra.txt").read_text(), "extra")
+        # ...but one holding something that stays (a symlink) blocks the restore before anything moves.
+        (self.root / "big.bin").rename(self.root / "big2.bin")
+        (self.root / "big.bin").mkdir()
+        os.symlink("/nonexistent", self.root / "big.bin/link")
+        before = files_under(self.root)
+        plan = dirloc.build_plan(self.root, snap)
+        with self.assertRaises(dirloc.DirlocError):
+            dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertEqual(files_under(self.root), before)
+        self.assertTrue((self.root / "big.bin/link").is_symlink())
+
+    def test_failed_restore_rolls_back_everything(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        (self.root / "a/one.txt").rename(self.root / "moved1.txt")
+        (self.root / "c/three.txt").rename(self.root / "moved3.txt")
+        before = files_under(self.root)
+        plan = dirloc.build_plan(self.root, snap)
+        self.assertEqual(len(plan.moves), 2)
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            # Fail on the last install (2 stagings + 2 installs).
+            calls["n"] += 1
+            if calls["n"] == 4:
+                raise OSError("disk on fire")
+            real_replace(src, dst)
+
+        with unittest.mock.patch.object(dirloc.os, "replace", flaky), self.assertRaises(OSError):
+            dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertEqual(files_under(self.root), before)
+        self.assertEqual((self.root / "moved1.txt").read_text(), "one")
+        self.assertEqual(list((self.root / dirloc.STORE_DIR).glob("staging-*")), [])
+
+    def test_symlinked_parent_blocks_restore_and_output(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        outside = Path(tempfile.mkdtemp())
+        try:
+            (self.root / "c/three.txt").rename(self.root / "three.txt")
+            shutil.rmtree(self.root / "c")
+            os.symlink(outside, self.root / "c")
+            before = files_under(self.root)
+            plan = dirloc.build_plan(self.root, snap)
+            with self.assertRaises(dirloc.DirlocError):
+                dirloc.apply_in_place(self.root, plan, snap.id)
+            self.assertEqual(files_under(self.root), before)
+            self.assertEqual(list(outside.iterdir()), [])
+
+            out = Path(tempfile.mkdtemp()) / "out"
+            (out / "a").mkdir(parents=True)
+            os.symlink(outside, out / "c")
+            with self.assertRaises(dirloc.DirlocError):
+                dirloc.apply_to_output(self.root, plan, out)
+            self.assertEqual(list(outside.iterdir()), [])
+            shutil.rmtree(out.parent)
+        finally:
+            shutil.rmtree(outside)
+
+    def test_snapshot_name_and_path_validation(self):
+        for bad in ("..\\outside", "../x", "a/b", "latest", "", ".hidden"):
+            with self.assertRaises(dirloc.DirlocError, msg=bad):
+                dirloc.validate_snapshot_name(bad)
+        for bad in ("/etc/passwd", "../x", "a/../../x", ".dirloc/s.json", "a//b", ""):
+            with self.assertRaises(dirloc.DirlocError, msg=bad):
+                dirloc.validate_rel_path(bad)
+        _snap, path = dirloc.save_snapshot(self.root, name="s")
+        data = path.read_text().replace('"a/one.txt"', '"../escape.txt"')
+        path.write_text(data)
+        code, _, err = self.run_cli("list", str(self.root))
+        self.assertEqual(code, 0)
+        self.assertIn("unsafe path", err)
+        with self.assertRaises(dirloc.DirlocError):
+            dirloc.find_snapshot(self.root, "s")
+
+    def test_latest_tie_break_is_deterministic(self):
+        s1, _p1 = dirloc.save_snapshot(self.root, name="aaa")
+        s2, p2 = dirloc.save_snapshot(self.root, name="bbb")
+        self.assertLess(s1.created, s2.created)  # microsecond timestamps
+        p2.write_text(p2.read_text().replace(s2.created, s1.created))
+        self.assertEqual(dirloc.find_snapshot(self.root, "latest").id, "bbb")
 
     def test_errors_exit_2(self):
         code, _, err = self.run_cli("restore", str(self.root))
