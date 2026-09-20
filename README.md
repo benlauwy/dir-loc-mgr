@@ -55,9 +55,10 @@ Nothing is ever deleted. Conflicts (a symlink in the way, a non-empty
 directory at a target path) are detected before anything is touched, and the
 restore refuses to run. In-place restore then moves every file through a
 staging directory, so swaps and chains (`a -> b`, `b -> c`) are safe; if a
-move fails midway, all moves are rolled back. Directories left empty by the
-moves are removed. `--dry-run` (or `diff`) prints the plan without touching
-anything.
+move fails midway, all moves are rolled back (and if even that fails, the
+files still in transit are left in `.dirloc/staging-*` and the path is
+reported, so nothing is lost). Directories left empty by the moves are
+removed. `--dry-run` (or `diff`) prints the plan without touching anything.
 
 ### Duplicates
 

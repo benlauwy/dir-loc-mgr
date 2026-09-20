@@ -11,6 +11,7 @@ Snapshots are stored as JSON files under ``<dir>/.dirloc/``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import hashlib
 import json
@@ -159,9 +160,13 @@ class Snapshot:
         }
 
     @classmethod
-    def from_json(cls, data: dict) -> Snapshot:
+    def from_json(cls, data: object) -> Snapshot:
+        if not isinstance(data, dict):
+            raise DirlocError("snapshot must be a JSON object")
         if data.get("format_version") != FORMAT_VERSION:
             raise DirlocError(f"unsupported snapshot format: {data.get('format_version')!r}")
+        if data.get("fingerprint_scheme") != FINGERPRINT_SCHEME:
+            raise DirlocError(f"unsupported fingerprint scheme: {data.get('fingerprint_scheme')!r}")
         files = data["files"]
         if not isinstance(files, dict):
             raise DirlocError("snapshot 'files' must be an object")
@@ -215,9 +220,11 @@ def save_snapshot(root: Path, description: str = "", name: str | None = None) ->
     sdir = store_dir(root)
     sdir.mkdir(exist_ok=True)
     out = sdir / f"{snap.id}.json"
-    if out.exists():
-        raise DirlocError(f"snapshot {snap.id!r} already exists")
-    out.write_text(json.dumps(snap.to_json(), indent=2) + "\n")
+    try:
+        with out.open("x", encoding="utf-8") as fh:
+            fh.write(json.dumps(snap.to_json(), indent=2) + "\n")
+    except FileExistsError:
+        raise DirlocError(f"snapshot {snap.id!r} already exists") from None
     return snap, out
 
 
@@ -228,8 +235,11 @@ def list_snapshots(root: Path) -> list[Snapshot]:
     snaps = []
     for f in sorted(sdir.glob("*.json")):
         try:
-            snaps.append(Snapshot.from_json(json.loads(f.read_text())))
-        except (OSError, ValueError, KeyError, DirlocError) as e:
+            snap = Snapshot.from_json(json.loads(f.read_text()))
+            if snap.id != f.stem:
+                raise DirlocError(f"snapshot id {snap.id!r} does not match filename")
+            snaps.append(snap)
+        except (OSError, ValueError, KeyError, TypeError, DirlocError) as e:
             print(f"warning: skipping unreadable snapshot {f.name}: {e}", file=sys.stderr)
     snaps.sort(key=lambda s: (s.created, s.id))
     return snaps
@@ -283,15 +293,33 @@ class Plan:
         return not self.moves and not self.unsorted
 
 
+def _suffixed(name: str, n: int) -> str:
+    p = PurePosixPath(name)
+    return f"{p.stem}~{n}{p.suffix}"
+
+
 def _unsorted_target(rel: str, taken: set[str]) -> str:
-    base = f"{UNSORTED_DIR}/{rel}"
-    candidate = base
-    n = 1
-    while candidate in taken:
-        p = PurePosixPath(base)
-        candidate = str(p.with_name(f"{p.stem}~{n}{p.suffix}"))
-        n += 1
-    return candidate
+    """Pick ``_unsorted/<rel>``, adding ``~N`` suffixes until it clashes with nothing in *taken*.
+
+    A clash is an equal path, or one path being an ancestor of the other (a
+    file cannot share a name with a directory). The clashing component is the
+    one that gets suffixed, so ``_unsorted/x`` (existing file) + new ``x/y``
+    yields ``_unsorted/x~1/y``.
+    """
+    parts = list(PurePosixPath(f"{UNSORTED_DIR}/{rel}").parts)
+    counters = [0] * len(parts)
+    while True:
+        candidate = "/".join(parts)
+        clash = next(
+            (t for t in taken if t == candidate or t.startswith(candidate + "/") or candidate.startswith(t + "/")),
+            None,
+        )
+        if clash is None:
+            return candidate
+        depth = min(len(PurePosixPath(clash).parts), len(parts)) - 1
+        counters[depth] += 1
+        original = PurePosixPath(f"{UNSORTED_DIR}/{rel}").parts[depth]
+        parts[depth] = _suffixed(original, counters[depth])
 
 
 def build_plan(root: Path, snap: Snapshot) -> Plan:
@@ -402,7 +430,9 @@ def apply_in_place(root: Path, plan: Plan, snap_id: str) -> None:
 
     Conflicts are detected before anything is touched. Files then go through a
     staging directory (so swaps and chains are safe); if anything fails
-    midway, every move is undone.
+    midway, every move is undone. Should the undo itself fail, nothing is
+    deleted: whatever is still in the staging directory is left there and its
+    path is reported.
     """
     all_moves = plan.moves + plan.unsorted
     if not all_moves:
@@ -431,18 +461,25 @@ def apply_in_place(root: Path, plan: Plan, snap_id: str) -> None:
             final.parent.mkdir(parents=True, exist_ok=True)
             os.replace(tmp, final)
             installed.append((final, tmp))
-    except Exception:
-        for final, tmp in reversed(installed):
-            os.replace(final, tmp)
-        for d in reversed(removed_dirs):
-            d.mkdir(exist_ok=True)
-        for src, tmp in staged:
-            if tmp.exists():
-                (root / src).parent.mkdir(parents=True, exist_ok=True)
-                os.replace(tmp, root / src)
+    except Exception as exc:
+        try:
+            for final, tmp in reversed(installed):
+                os.replace(final, tmp)
+            for d in reversed(removed_dirs):
+                d.mkdir(exist_ok=True)
+            for src, tmp in staged:
+                if tmp.exists():
+                    (root / src).parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(tmp, root / src)
+        except OSError as undo_exc:
+            raise DirlocError(
+                f"restore failed ({exc}) and rolling back also failed ({undo_exc}); "
+                f"files still in transit were left under {staging}"
+            ) from exc
         raise
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            staging.rmdir()
     _prune_empty_dirs(root, vacated)
 
 

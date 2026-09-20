@@ -334,6 +334,64 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(dirloc.DirlocError):
             dirloc.find_snapshot(self.root, "s")
 
+    def test_malformed_snapshot_files_are_skipped(self):
+        dirloc.save_snapshot(self.root, name="good")
+        store = self.root / dirloc.STORE_DIR
+        (store / "notobj.json").write_text("[1, 2, 3]")
+        (store / "scheme.json").write_text(
+            (store / "good.json")
+            .read_text()
+            .replace(dirloc.FINGERPRINT_SCHEME, "md5-full")
+            .replace('"good"', '"scheme"')
+        )
+        (store / "renamed.json").write_text((store / "good.json").read_text())  # id "good" != filename
+        code, out, err = self.run_cli("list", str(self.root))
+        self.assertEqual(code, 0)
+        self.assertIn("good", out)
+        for name in ("notobj.json", "scheme.json", "renamed.json"):
+            self.assertIn(name, err)
+        self.assertEqual([s.id for s in dirloc.list_snapshots(self.root)], ["good"])
+        code, _, _ = self.run_cli("delete", str(self.root), "-s", "good")
+        self.assertEqual(code, 0)
+        self.assertTrue((store / "renamed.json").exists())
+        self.assertFalse((store / "good.json").exists())
+
+    def test_unsorted_nested_collisions(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        write(self.root, "_unsorted/x/child.txt", "old")  # existing dir at _unsorted/x
+        write(self.root, "x", "new x")  # wants _unsorted/x
+        write(self.root, "_unsorted/y", "old y")  # existing file at _unsorted/y
+        write(self.root, "y/child.txt", "new y")  # wants _unsorted/y/child.txt
+        plan = dirloc.build_plan(self.root, snap)
+        self.assertEqual(sorted(plan.unsorted), [("x", "_unsorted/x~1"), ("y/child.txt", "_unsorted/y~1/child.txt")])
+        dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertEqual((self.root / "_unsorted/x~1").read_text(), "new x")
+        self.assertEqual((self.root / "_unsorted/y~1/child.txt").read_text(), "new y")
+        self.assertEqual((self.root / "_unsorted/y").read_text(), "old y")
+
+    def test_failed_rollback_keeps_staged_files(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        (self.root / "a/one.txt").rename(self.root / "moved1.txt")
+        (self.root / "c/three.txt").rename(self.root / "moved3.txt")
+        plan = dirloc.build_plan(self.root, snap)
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] >= 4:  # last install fails, and so does the undo
+                raise OSError("disk on fire")
+            real_replace(src, dst)
+
+        with unittest.mock.patch.object(dirloc.os, "replace", flaky), self.assertRaises(dirloc.DirlocError) as cm:
+            dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertIn("left under", str(cm.exception))
+        staging = list((self.root / dirloc.STORE_DIR).glob("staging-*"))
+        self.assertEqual(len(staging), 1)
+        # Nothing lost: every byte is either at its original path, its target, or in staging.
+        contents = {p.read_bytes() for p in self.root.rglob("*") if p.is_file() and p.suffix != ".json"}
+        self.assertTrue({b"one", b"three"} <= contents)
+
     def test_latest_tie_break_is_deterministic(self):
         s1, _p1 = dirloc.save_snapshot(self.root, name="aaa")
         s2, p2 = dirloc.save_snapshot(self.root, name="bbb")
