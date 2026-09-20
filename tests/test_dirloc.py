@@ -417,6 +417,27 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((self.root / "a").read_text(), "one")
         self.assertFalse(list((self.root / dirloc.STORE_DIR).glob("staging-*")))
 
+    def test_rollback_removes_dirs_when_mkdir_fails_partway(self):
+        snap, _ = dirloc.save_snapshot(self.root)
+        (self.root / "a/b/two.txt").rename(self.root / "two.txt")
+        (self.root / "a/one.txt").rename(self.root / "one.txt")
+        shutil.rmtree(self.root / "a")
+        before = files_under(self.root)
+        plan = dirloc.build_plan(self.root, snap)
+        self.assertEqual(plan.moves, [("two.txt", "a/b/two.txt"), ("one.txt", "a/one.txt")])
+        real_mkdir = Path.mkdir
+
+        def flaky(self_path, *a, **kw):
+            if self_path.name == "b":  # 'a' has already been created by this point
+                raise OSError("boom")
+            real_mkdir(self_path, *a, **kw)
+
+        with unittest.mock.patch.object(Path, "mkdir", flaky), self.assertRaises(OSError):
+            dirloc.apply_in_place(self.root, plan, snap.id)
+        self.assertEqual(files_under(self.root), before)
+        self.assertFalse((self.root / "a").exists())
+        self.assertFalse(list((self.root / dirloc.STORE_DIR).glob("staging-*")))
+
     def test_failed_save_does_not_reserve_name(self):
         with (
             unittest.mock.patch.object(dirloc.json, "dumps", side_effect=OSError("disk full")),

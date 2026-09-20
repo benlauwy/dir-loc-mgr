@@ -413,15 +413,15 @@ def _check_targets(base: Path, targets: list[str], vacating: set[str]) -> None:
         raise DirlocError(f"cannot restore {dst}: target already exists")
 
 
-def _mkdir_tracking(d: Path) -> list[Path]:
-    """``mkdir -p`` that returns the directories it actually created, shallowest first."""
+def _mkdir_tracking(d: Path, created: list[Path]) -> None:
+    """``mkdir -p`` that appends each directory to *created* as soon as it exists."""
     missing: list[Path] = []
     while not d.exists():
         missing.append(d)
         d = d.parent
     for p in reversed(missing):
         p.mkdir()
-    return list(reversed(missing))
+        created.append(p)
 
 
 def _remove_empty_tree(d: Path) -> list[Path]:
@@ -477,7 +477,7 @@ def apply_in_place(root: Path, plan: Plan, snap_id: str) -> None:
                 removed_dirs.extend(_remove_empty_tree(final))
             elif final.exists() or final.is_symlink():
                 raise DirlocError(f"cannot restore {dst}: target already exists")
-            created_dirs.extend(_mkdir_tracking(final.parent))
+            _mkdir_tracking(final.parent, created_dirs)
             os.replace(tmp, final)
             installed.append((final, tmp))
     except Exception as exc:
